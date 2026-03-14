@@ -13,6 +13,18 @@
 file(GLOB zycgeo_hausdorff_src "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 add_library(zycgeo_hausdorff ${zycgeo_hausdorff_src})
-target_link_libraries(zycgeo_hausdorff zycgeo_core 
-                                       zycgeo_mesh 
+target_link_libraries(zycgeo_hausdorff zycgeo_core
+                                       zycgeo_mesh
                                        zycgeo_bvh)
+
+# GPU initial bounds library
+add_library(zycgeo_gpu_bounds STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_initial_bounds.cu
+)
+set_target_properties(zycgeo_gpu_bounds PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+target_include_directories(zycgeo_gpu_bounds PUBLIC
+    ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(zycgeo_gpu_bounds PRIVATE zycgeo_lbvh cudart)
