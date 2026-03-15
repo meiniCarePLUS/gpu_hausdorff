@@ -136,7 +136,7 @@ int main(int argc, char **argv) // parse arguments and call Hausdorff
     }
     logs(cout) << "[stop_condition] " << (stop == StopCondition::ABS ? "abs" : "rel") << std::endl;
 
-    // build bvh tree
+    // build bvh tree + GPU LBVH (both counted in bvh_build_cost)
     high_resolution_clock::time_point begin_clock = high_resolution_clock::now();
     tri_mesh meshes[2] = {A, B};
     vector<tri_with_id> tris[2];
@@ -146,6 +146,18 @@ int main(int argc, char **argv) // parse arguments and call Hausdorff
         build_primitive_array(meshes[m], tris[m]);
         pbvh[m]->build_bvh(&tris[m][0], &tris[m][0] + tris[m].size());
     }
+
+    // Build GPU LBVH for mesh B (reuse tris[1] data already computed above).
+    {
+        size_t nB = t[1].size(2);
+        std::vector<double> b_verts(nB * 9);
+        for (size_t ti = 0; ti < nB; ++ti)
+            for (size_t vi = 0; vi < 3; ++vi)
+                for (size_t d = 0; d < 3; ++d)
+                    b_verts[ti*9 + vi*3 + d] = v[1](d, t[1](vi, ti));
+        gpu_plain_init_B(b_verts.data(), (int)nB);
+    }
+
     high_resolution_clock::time_point end_clock = high_resolution_clock::now();
     logs(cout)
         << INFO << "[bvh_build_cost] "
@@ -175,18 +187,6 @@ int main(int argc, char **argv) // parse arguments and call Hausdorff
         stop_condition = [error](double L, double U) { return U - L < error; };
     } else {
         stop_condition = [error](double L, double U) { return U - L < L * error; };
-    }
-
-    // Build GPU LBVH for mesh B (used in main loop's closest-cache pre-fill).
-    {
-        // Pack mesh B triangles as flat double array [9*nB].
-        size_t nB = t[1].size(2);
-        std::vector<double> b_verts(nB * 9);
-        for (size_t ti = 0; ti < nB; ++ti)
-            for (size_t vi = 0; vi < 3; ++vi)
-                for (size_t d = 0; d < 3; ++d)
-                    b_verts[ti*9 + vi*3 + d] = v[1](d, t[1](vi, ti));
-        gpu_plain_init_B(b_verts.data(), (int)nB);
     }
 
     hausdorff_result hd_result =
