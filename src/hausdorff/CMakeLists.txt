@@ -17,9 +17,10 @@ target_link_libraries(zycgeo_hausdorff zycgeo_core
                                        zycgeo_mesh
                                        zycgeo_bvh)
 
-# GPU initial bounds library
+# GPU initial bounds + batch query library
 add_library(zycgeo_gpu_bounds STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu_initial_bounds.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_batch_query.cu
 )
 set_target_properties(zycgeo_gpu_bounds PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
