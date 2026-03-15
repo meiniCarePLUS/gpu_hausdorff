@@ -46,6 +46,17 @@ __device__ double lbvh_nearest_sqr(
         int node_idx = stack[--top];
         const LBVHNode& node = nodes[node_idx];
 
+        // Re-check AABB distance after popping (best may have improved).
+        {
+            double d = 0;
+            double px[3] = {p.x, p.y, p.z};
+            for (int k = 0; k < 3; ++k) {
+                if      (px[k] < node.aabb_min[k]) { double diff = node.aabb_min[k]-px[k]; d += diff*diff; }
+                else if (px[k] > node.aabb_max[k]) { double diff = px[k]-node.aabb_max[k]; d += diff*diff; }
+            }
+            if (d >= best) continue;
+        }
+
         if (node.prim_idx >= 0) {
             const float* fv = tris_B[node.prim_idx].v;
             double dv[9];
