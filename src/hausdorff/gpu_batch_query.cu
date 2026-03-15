@@ -2,6 +2,7 @@
 #include "core/geometry/gpu_primitive_dis.cuh"
 
 #include <float.h>
+#include <vector>
 
 __device__ static double lbvh_nearest_sqr_idx(
     d3 p,
