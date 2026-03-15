@@ -2,16 +2,15 @@
 
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
-#include <thrust/sequence.h>
-#include <thrust/gather.h>
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 // ─── Morton code helpers ─────────────────────────────────────────────────────
 
-// Expand a 10-bit integer into 30 bits by inserting 2 zeros between each bit.
-__device__ __forceinline__ uint32_t expand_bits(uint32_t v) {
+static inline uint32_t expand_bits(uint32_t v) {
     v = (v * 0x00010001u) & 0xFF0000FFu;
     v = (v * 0x00000101u) & 0x0F00F00Fu;
     v = (v * 0x00000011u) & 0xC30C30C3u;
@@ -19,8 +18,7 @@ __device__ __forceinline__ uint32_t expand_bits(uint32_t v) {
     return v;
 }
 
-// 3D Morton code from normalised [0,1]^3 coordinates.
-__device__ __forceinline__ uint32_t morton3D(float x, float y, float z) {
+static inline uint32_t morton3D(float x, float y, float z) {
     x = fminf(fmaxf(x * 1024.f, 0.f), 1023.f);
     y = fminf(fmaxf(y * 1024.f, 0.f), 1023.f);
     z = fminf(fmaxf(z * 1024.f, 0.f), 1023.f);
@@ -29,145 +27,66 @@ __device__ __forceinline__ uint32_t morton3D(float x, float y, float z) {
             expand_bits((uint32_t)z);
 }
 
-// ─── Kernel: Morton codes ────────────────────────────────────────────────────
+// ─── CPU BVH build (recursive, SAH-free median split) ────────────────────────
+// Builds into a flat array of LBVHNode on the host, then uploads to device.
+// Node layout: internal nodes [0..n-2], leaf nodes [n-1..2n-2].
+// This matches the layout expected by lbvh_nearest_sqr.
 
-__global__ void kernel_compute_morton(
-    const float3x3* __restrict__ tris,
-    uint32_t* __restrict__ out_morton,
-    int* __restrict__ out_idx,
-    float3 scene_min, float3 scene_inv_extent,
-    int n)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+struct BuildTri {
+    uint32_t morton;
+    int      orig_idx;
+};
 
-    // centroid = average of 3 vertices
-    const float* v = tris[i].v;
-    float cx = (v[0] + v[3] + v[6]) * (1.f / 3.f);
-    float cy = (v[1] + v[4] + v[7]) * (1.f / 3.f);
-    float cz = (v[2] + v[5] + v[8]) * (1.f / 3.f);
-
-    // normalise to [0,1]
-    float nx = (cx - scene_min.x) * scene_inv_extent.x;
-    float ny = (cy - scene_min.y) * scene_inv_extent.y;
-    float nz = (cz - scene_min.z) * scene_inv_extent.z;
-
-    out_morton[i] = morton3D(nx, ny, nz);
-    out_idx[i]    = i;
-}
-
-// ─── Kernel: binary radix tree (Karras 2012) ─────────────────────────────────
-
-// delta(i,j): length of longest common prefix of morton[i] and morton[j].
-// Returns -1 if j is out of range.
-__device__ __forceinline__ int delta(
-    const uint32_t* __restrict__ m, int i, int j, int n)
-{
-    if (j < 0 || j >= n) return -1;
-    if (m[i] == m[j])
-        // break ties with index
-        return 32 + __clz(i ^ j);
-    return __clz(m[i] ^ m[j]);
-}
-
-__global__ void kernel_build_tree(
-    const uint32_t* __restrict__ sorted_morton,
-    LBVHNode* __restrict__ nodes,
-    int n)
-{
-    // Internal node index i covers [0, n-2].
-    // Leaf node index i+n-1 covers [n-1, 2n-2].
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n - 1) return;
-
-    const uint32_t* m = sorted_morton;
-
-    // Determine direction of the range (+1 or -1).
-    int d = (delta(m, i, i + 1, n) - delta(m, i, i - 1, n)) >= 0 ? 1 : -1;
-
-    // Compute upper bound for the length of the range.
-    int delta_min = delta(m, i, i - d, n);
-    int l_max = 2;
-    while (delta(m, i, i + l_max * d, n) > delta_min)
-        l_max <<= 1;
-
-    // Binary search for the exact end of the range.
-    int l = 0;
-    for (int t = l_max >> 1; t >= 1; t >>= 1)
-        if (delta(m, i, i + (l + t) * d, n) > delta_min)
-            l += t;
-    int j = i + l * d;
-
-    // Find the split position within [min(i,j), max(i,j)].
-    int delta_node = delta(m, i, j, n);
-    int s = 0;
-    int step = l;
-    do {
-        step = (step + 1) >> 1;
-        if (delta(m, i, i + (s + step) * d, n) > delta_node)
-            s += step;
-    } while (step > 1);
-    int gamma = i + s * d + min(d, 0);
-
-    // Assign children.
-    int left_child  = (min(i, j) == gamma)     ? (gamma + n - 1)     : gamma;
-    int right_child = (max(i, j) == gamma + 1) ? (gamma + 1 + n - 1) : (gamma + 1);
-
-    nodes[i].left      = left_child;
-    nodes[i].right     = right_child;
-    nodes[i].prim_idx  = -1;
-
-    nodes[left_child].parent  = i;
-    nodes[right_child].parent = i;
-}
-
-// ─── Kernel: bottom-up AABB refit ────────────────────────────────────────────
-
-__device__ __forceinline__ void aabb_of_tri(
-    const float3x3& tri, float* bmin, float* bmax)
-{
+static void aabb_of_tri(const float3x3& tri, float* bmin, float* bmax) {
     for (int k = 0; k < 3; ++k) {
-        float a = tri.v[k], b = tri.v[k + 3], c = tri.v[k + 6];
-        bmin[k] = fminf(fminf(a, b), c);
-        bmax[k] = fmaxf(fmaxf(a, b), c);
+        float a = tri.v[k], b = tri.v[k+3], c = tri.v[k+6];
+        bmin[k] = fminf(fminf(a,b),c);
+        bmax[k] = fmaxf(fmaxf(a,b),c);
     }
 }
 
-__global__ void kernel_refit(
-    const float3x3* __restrict__ tris,
-    const int* __restrict__ sorted_idx,
-    LBVHNode* __restrict__ nodes,
-    int* __restrict__ flags,
-    int n)
+// Recursively build subtree covering sorted_tris[lo..hi].
+// Returns the node index assigned to this subtree.
+// next_internal: pointer to next available internal node index (starts at 0).
+// next_leaf:     pointer to next available leaf node index (starts at n-1).
+static int build_recursive(
+    std::vector<LBVHNode>& nodes,
+    const std::vector<BuildTri>& sorted_tris,
+    const float3x3* tris,
+    int lo, int hi,
+    int& next_internal, int& next_leaf)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-
-    // Initialise leaf node (index = i + n - 1).
-    int leaf = i + n - 1;
-    nodes[leaf].prim_idx = sorted_idx[i];
-    nodes[leaf].left     = -1;
-    nodes[leaf].right    = -1;
-    aabb_of_tri(tris[sorted_idx[i]],
-                nodes[leaf].aabb_min,
-                nodes[leaf].aabb_max);
-
-    // Walk up the tree; the second thread to reach a node processes it.
-    int node = nodes[leaf].parent;
-    while (node != -1) {
-        // atomicAdd returns old value; first thread gets 0 and exits.
-        if (atomicAdd(&flags[node], 1) == 0) return;
-
-        int lc = nodes[node].left;
-        int rc = nodes[node].right;
-        for (int k = 0; k < 3; ++k) {
-            nodes[node].aabb_min[k] = fminf(nodes[lc].aabb_min[k],
-                                            nodes[rc].aabb_min[k]);
-            nodes[node].aabb_max[k] = fmaxf(nodes[lc].aabb_max[k],
-                                            nodes[rc].aabb_max[k]);
-        }
-        node = nodes[node].parent;
+    if (lo == hi) {
+        // Leaf
+        int idx = next_leaf++;
+        nodes[idx].prim_idx = sorted_tris[lo].orig_idx;
+        nodes[idx].left     = -1;
+        nodes[idx].right    = -1;
+        aabb_of_tri(tris[sorted_tris[lo].orig_idx],
+                    nodes[idx].aabb_min, nodes[idx].aabb_max);
+        return idx;
     }
+
+    // Internal node
+    int idx = next_internal++;
+    nodes[idx].prim_idx = -1;
+
+    // Split at median
+    int mid = (lo + hi) / 2;
+    int lc = build_recursive(nodes, sorted_tris, tris, lo,    mid, next_internal, next_leaf);
+    int rc = build_recursive(nodes, sorted_tris, tris, mid+1, hi,  next_internal, next_leaf);
+
+    nodes[idx].left  = lc;
+    nodes[idx].right = rc;
+    nodes[lc].parent = idx;
+    nodes[rc].parent = idx;
+
+    // Merge AABBs
+    for (int k = 0; k < 3; ++k) {
+        nodes[idx].aabb_min[k] = fminf(nodes[lc].aabb_min[k], nodes[rc].aabb_min[k]);
+        nodes[idx].aabb_max[k] = fmaxf(nodes[lc].aabb_max[k], nodes[rc].aabb_max[k]);
+    }
+    return idx;
 }
 
 // ─── Host: LBVH::build ───────────────────────────────────────────────────────
@@ -176,66 +95,55 @@ void LBVH::build(const float3x3* h_tris, int n) {
     if (n <= 0) throw std::invalid_argument("LBVH::build: n must be > 0");
     n_prims = n;
 
-    // Upload triangles.
-    float3x3* d_tris;
-    cudaMalloc(&d_tris, n * sizeof(float3x3));
-    cudaMemcpy(d_tris, h_tris, n * sizeof(float3x3), cudaMemcpyHostToDevice);
-
-    // Compute scene AABB on host (cheap for moderate n).
-    float3 smin = {1e30f, 1e30f, 1e30f};
-    float3 smax = {-1e30f, -1e30f, -1e30f};
-    for (int i = 0; i < n; ++i) {
+    // Compute scene AABB
+    float smin[3] = {1e30f, 1e30f, 1e30f};
+    float smax[3] = {-1e30f, -1e30f, -1e30f};
+    for (int i = 0; i < n; ++i)
         for (int k = 0; k < 3; ++k) {
             float a = h_tris[i].v[k], b = h_tris[i].v[k+3], c = h_tris[i].v[k+6];
-            float lo = fminf(fminf(a,b),c), hi = fmaxf(fmaxf(a,b),c);
-            ((float*)&smin)[k] = fminf(((float*)&smin)[k], lo);
-            ((float*)&smax)[k] = fmaxf(((float*)&smax)[k], hi);
+            smin[k] = fminf(smin[k], fminf(fminf(a,b),c));
+            smax[k] = fmaxf(smax[k], fmaxf(fmaxf(a,b),c));
         }
-    }
-    float3 inv_ext = {
-        1.f / fmaxf(smax.x - smin.x, 1e-10f),
-        1.f / fmaxf(smax.y - smin.y, 1e-10f),
-        1.f / fmaxf(smax.z - smin.z, 1e-10f)
-    };
+    float inv[3];
+    for (int k = 0; k < 3; ++k)
+        inv[k] = 1.f / fmaxf(smax[k]-smin[k], 1e-10f);
 
-    // Allocate device arrays.
-    cudaMalloc(&d_morton,     n * sizeof(uint32_t));
-    cudaMalloc(&d_sorted_idx, n * sizeof(int));
+    // Compute Morton codes and sort
+    std::vector<BuildTri> bt(n);
+    for (int i = 0; i < n; ++i) {
+        float cx = (h_tris[i].v[0]+h_tris[i].v[3]+h_tris[i].v[6])*(1.f/3.f);
+        float cy = (h_tris[i].v[1]+h_tris[i].v[4]+h_tris[i].v[7])*(1.f/3.f);
+        float cz = (h_tris[i].v[2]+h_tris[i].v[5]+h_tris[i].v[8])*(1.f/3.f);
+        bt[i].morton   = morton3D((cx-smin[0])*inv[0], (cy-smin[1])*inv[1], (cz-smin[2])*inv[2]);
+        bt[i].orig_idx = i;
+    }
+    std::stable_sort(bt.begin(), bt.end(),
+        [](const BuildTri& a, const BuildTri& b){ return a.morton < b.morton; });
+
+    // Build tree on CPU
+    // Node layout: internal [0..n-2], leaf [n-1..2n-2]
+    std::vector<LBVHNode> h_nodes(2*n-1);
+    // Init parent of root to -1
+    h_nodes[0].parent = -1;
+
+    int ni = 0, nl = n-1;
+    int root = build_recursive(h_nodes, bt, h_tris, 0, n-1, ni, nl);
+    // root must be node 0 for traversal starting at index 0
+    // build_recursive assigns internal nodes in pre-order, so root = 0. ✓
+
+    // Upload to device
     cudaMalloc(&d_nodes,      (2*n-1) * sizeof(LBVHNode));
+    cudaMalloc(&d_sorted_idx, n * sizeof(int));
+    cudaMalloc(&d_morton,     n * sizeof(uint32_t));
 
-    // Initialise root parent sentinel.
-    {
-        LBVHNode root_sentinel{};
-        root_sentinel.parent = -1;
-        cudaMemcpy(d_nodes, &root_sentinel, sizeof(LBVHNode), cudaMemcpyHostToDevice);
-    }
+    cudaMemcpy(d_nodes, h_nodes.data(), (2*n-1)*sizeof(LBVHNode), cudaMemcpyHostToDevice);
 
-    // Step 1: Morton codes.
-    int block = 256, grid = (n + block - 1) / block;
-    kernel_compute_morton<<<grid, block>>>(
-        d_tris, d_morton, d_sorted_idx, smin, inv_ext, n);
-
-    // Step 2: Sort by Morton code (Thrust stable sort by key).
-    thrust::device_ptr<uint32_t> t_morton(d_morton);
-    thrust::device_ptr<int>      t_idx(d_sorted_idx);
-    thrust::stable_sort_by_key(t_morton, t_morton + n, t_idx);
-
-    // Step 3: Build binary radix tree.
-    if (n > 1) {
-        int igrid = (n - 1 + block - 1) / block;
-        // Zero-init parent fields of all nodes first.
-        cudaMemset(d_nodes, 0xFF, (2*n-1) * sizeof(LBVHNode)); // -1 = 0xFF...
-        kernel_build_tree<<<igrid, block>>>(d_morton, d_nodes, n);
-    }
-
-    // Step 4: Refit AABBs bottom-up.
-    int* d_flags;
-    cudaMalloc(&d_flags, (n-1) * sizeof(int));
-    cudaMemset(d_flags, 0, (n-1) * sizeof(int));
-    kernel_refit<<<grid, block>>>(d_tris, d_sorted_idx, d_nodes, d_flags, n);
-
-    cudaFree(d_flags);
-    cudaFree(d_tris);
+    // sorted_idx and morton for reference (not used by traversal)
+    std::vector<int>      h_idx(n);
+    std::vector<uint32_t> h_morton(n);
+    for (int i = 0; i < n; ++i) { h_idx[i] = bt[i].orig_idx; h_morton[i] = bt[i].morton; }
+    cudaMemcpy(d_sorted_idx, h_idx.data(),    n*sizeof(int),      cudaMemcpyHostToDevice);
+    cudaMemcpy(d_morton,     h_morton.data(), n*sizeof(uint32_t), cudaMemcpyHostToDevice);
 }
 
 void LBVH::free() {

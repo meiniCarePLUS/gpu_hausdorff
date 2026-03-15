@@ -29,30 +29,3 @@ struct LBVH {
     void build(const float3x3* h_tris, int n);
     void free();
 };
-
-// ─── Kernel declarations ────────────────────────────────────────────────────
-
-// Compute 30-bit Morton code for each triangle centroid.
-// tris[n], out_morton[n], out_idx[n] (identity permutation before sort)
-__global__ void kernel_compute_morton(
-    const float3x3* __restrict__ tris,
-    uint32_t* __restrict__ out_morton,
-    int* __restrict__ out_idx,
-    float3 scene_min, float3 scene_inv_extent,
-    int n);
-
-// Build internal nodes of binary radix tree (Karras 2012).
-// sorted_morton[n], nodes[2n-1]
-__global__ void kernel_build_tree(
-    const uint32_t* __restrict__ sorted_morton,
-    LBVHNode* __restrict__ nodes,
-    int n);
-
-// Bottom-up AABB refit.
-// tris[n] (original order), sorted_idx[n], nodes[2n-1], atomic flags[n-1]
-__global__ void kernel_refit(
-    const float3x3* __restrict__ tris,
-    const int* __restrict__ sorted_idx,
-    LBVHNode* __restrict__ nodes,
-    int* __restrict__ flags,   // atomic counters, zero-initialised
-    int n);
