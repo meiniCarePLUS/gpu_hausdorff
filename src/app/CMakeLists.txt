@@ -11,7 +11,8 @@
 #	Licensed under the MIT License.
 
 add_executable(hausdorff main.cpp)
-target_link_libraries(hausdorff zycgeo_hausdorff zjucad::matrix meshio cxxopts)
+target_link_libraries(hausdorff zycgeo_hausdorff zjucad::matrix meshio cxxopts zycgeo_gpu_bounds zycgeo_lbvh cudart)
+target_include_directories(hausdorff PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 add_executable(test_lbvh test_lbvh.cu)
 target_link_libraries(test_lbvh zycgeo_lbvh cudart)

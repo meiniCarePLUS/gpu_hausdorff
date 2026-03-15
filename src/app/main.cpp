@@ -21,6 +21,7 @@
 #include "bvh/bvh.h"
 #include "core/geometry/bbox.hpp"
 #include "hausdorff/hausdorff.h"
+#include "hausdorff/gpu_query_iface.hpp"
 #include "hausdorff/stop_condition.h"
 #include "mesh/adjacent_table.hpp"
 #include "mesh/mesh_util.hpp"
@@ -176,8 +177,22 @@ int main(int argc, char **argv) // parse arguments and call Hausdorff
         stop_condition = [error](double L, double U) { return U - L < L * error; };
     }
 
+    // Build GPU LBVH for mesh B (used in main loop's closest-cache pre-fill).
+    {
+        // Pack mesh B triangles as flat double array [9*nB].
+        size_t nB = t[1].size(2);
+        std::vector<double> b_verts(nB * 9);
+        for (size_t ti = 0; ti < nB; ++ti)
+            for (size_t vi = 0; vi < 3; ++vi)
+                for (size_t d = 0; d < 3; ++d)
+                    b_verts[ti*9 + vi*3 + d] = v[1](d, t[1](vi, ti));
+        gpu_plain_init_B(b_verts.data(), (int)nB);
+    }
+
     hausdorff_result hd_result =
         hausdorff(A, B, pbvh, trait, use_voronoi, stop_condition);
+
+    gpu_plain_free_B();
 
     std::cout << std::endl
               << std::endl;

@@ -24,6 +24,7 @@
 #include "core/geometry/primitive_dis.hpp"
 #include "hausdorff.h"
 #include "hausdorff/closest_cache.hpp"
+#include "hausdorff/gpu_query_iface.hpp"
 #include "hausdorff_internal.h"
 #include "mesh/adjacent_table.hpp"
 
@@ -172,8 +173,34 @@ hausdorff_result hausdorff(tri_mesh &A, const tri_mesh &B,
 
         // subdivide triangle into four, and update model
         primitive_t t[4];
-
         subdivide(A, trait->closest_cache_, adjacent_table, pbvh[1], B, pwhd.prim, use_voronoi, t, voronoi_count, mid_count);
+
+        // GPU pre-fill closest_cache_ for cache-miss vertices of the 4 sub-triangles.
+        {
+            double pts_buf[6*3];
+            size_t ids_buf[6];
+            int n_unique = 0;
+            for (int ti = 0; ti < 4; ++ti)
+                for (int vi = 0; vi < 3; ++vi) {
+                    size_t id = t[ti].point_id(vi, 0);
+                    if (trait->closest_cache_.get(id) != nullptr) continue;
+                    bool dup = false;
+                    for (int j = 0; j < n_unique; ++j) if (ids_buf[j] == id) { dup = true; break; }
+                    if (dup) continue;
+                    ids_buf[n_unique]       = id;
+                    pts_buf[n_unique*3+0]   = t[ti].points(0, vi);
+                    pts_buf[n_unique*3+1]   = t[ti].points(1, vi);
+                    pts_buf[n_unique*3+2]   = t[ti].points(2, vi);
+                    ++n_unique;
+                }
+            if (n_unique > 0) {
+                int nearest_buf[6];
+                gpu_plain_query(pts_buf, n_unique, nearest_buf);
+                for (int j = 0; j < n_unique; ++j)
+                    trait->closest_cache_.set(ids_buf[j],
+                        const_cast<primitive_t*>(&trait->tri_B_[nearest_buf[j]]));
+            }
+        }
 
         // calculate local bound
         // #pragma omp parallel for

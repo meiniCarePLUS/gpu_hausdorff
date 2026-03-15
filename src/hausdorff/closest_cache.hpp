@@ -37,6 +37,12 @@ public:
         return closest_cache_[id];
     }
 
+    void set(size_t id, primitive_t* prim) {
+        if (id >= closest_cache_.size())
+            closest_cache_.resize(id * 2, nullptr);
+        closest_cache_[id] = prim;
+    }
+
     primitive_t *get(size_t id, const point_t &point) {
         if (id >= closest_cache_.size()) {
             closest_cache_.resize(id * 2, nullptr);
